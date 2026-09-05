@@ -2,11 +2,6 @@
   "name": "bse-fastest--jsonapi",
   "main": "worker.js",
   "compatibility_date": "2026-08-24",
-  "triggers": {
-    "crons": [
-      "* 0-16 * * 1-5"
-    ]
-  },
   "kv_namespaces": [
     {
       "binding": "BSE_FASTEST_JSONAPIKV",
