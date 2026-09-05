@@ -1,17 +1,9 @@
 /*
- * BSE FASTEST JSON API – ALERT-FIRST (V1.0)
+ * BSE FASTEST JSON API – V1.1
  * Dedicated project for BSE corporate announcements via JSON API only.
  *
- * Goal: fastest possible Telegram / ntfy alerts.
- *
- * Design:
- *  - Hot path is extremely light: JSON API page 1 only, tiny seen set,
- *    watchlist match, alert. Target ~1–3 ms CPU (free plan 10 ms safe).
- *  - No XML parsing, no day-store rewrite, no heavy JSON on the monitor path.
- *  - Cloudflare cron minimum = 1 minute. For faster checks:
- *      (A) scheduled job runs a short BURST loop (several polls with waits)
- *      (B) external free cron (cron-job.org etc.) hits /monitor every 15–30s
- *  - Storage kept minimal (recentSeen fingerprints only).
+ * - Shows ALL recent announcements in the frontend
+ * - Sends Telegram / ntfy alerts ONLY for watchlist matches
  *
  * KV binding: BSE_FASTEST_JSONAPIKV
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -22,6 +14,7 @@ const BSE_ANN_API =
 
 const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
+const MAX_RECENT_ANNOUNCEMENTS = 150;
 
 const BURST_POLLS = 4;
 const BURST_GAP_MS = 14000;
@@ -168,6 +161,30 @@ function matchesWatchlist(row, watchlist) {
   return false;
 }
 
+function rowToAnnouncement(row, fetchedAt, isAlert) {
+  const company = String(row.SLONGNAME || "").trim() || "Scrip";
+  const scrip = String(row.SCRIP_CD || "").trim();
+  const title = String(row.HEADLINE || row.NEWSSUB || "New Announcement").trim();
+  let link = "";
+  if (row.ATTACHMENTNAME) {
+    link = `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${row.ATTACHMENTNAME}`;
+  } else if (row.NSURL) {
+    link = row.NSURL;
+  }
+  return {
+    company,
+    scrip,
+    title,
+    link,
+    fingerprint: computeFingerprint(row),
+    pubDate: parsePubDate(row),
+    fetchedAt,
+    alert: !!isAlert,
+  };
+}
+
+/* ---------- KV helpers ---------- */
+
 async function getWatchlist(env) {
   if (!env.BSE_FASTEST_JSONAPIKV) return [];
   const data = await env.BSE_FASTEST_JSONAPIKV.get("watchlist", "json");
@@ -223,6 +240,22 @@ async function saveAlerts(env, alerts) {
   await env.BSE_FASTEST_JSONAPIKV.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+async function getRecentAnnouncements(env) {
+  if (!env.BSE_FASTEST_JSONAPIKV) return [];
+  const data = await env.BSE_FASTEST_JSONAPIKV.get("recentAnnouncements", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveRecentAnnouncements(env, list) {
+  if (!env.BSE_FASTEST_JSONAPIKV) return;
+  await env.BSE_FASTEST_JSONAPIKV.put(
+    "recentAnnouncements",
+    JSON.stringify(list.slice(0, MAX_RECENT_ANNOUNCEMENTS))
+  );
+}
+
+/* ---------- core logic ---------- */
+
 async function fetchJsonPage1() {
   const dateStr = getIstDateStr();
   const url =
@@ -271,6 +304,27 @@ async function pollOnce(env) {
     page.push({ row, fp });
   }
 
+  // Always keep the latest page available for the frontend (all announcements)
+  const watchlist = await getWatchlist(env);
+  const currentPageItems = page.map(({ row, fp }) => {
+    const isAlert = matchesWatchlist(row, watchlist);
+    return rowToAnnouncement(row, fetchedAt, isAlert);
+  });
+
+  // Merge with previously stored recent announcements (dedupe by fingerprint)
+  const existing = await getRecentAnnouncements(env);
+  const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
+  const merged = [...currentPageItems];
+  for (const item of existing) {
+    if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
+    if (!seenFp.has(item.fingerprint)) {
+      seenFp.add(item.fingerprint);
+      merged.push(item);
+    }
+  }
+  await saveRecentAnnouncements(env, merged);
+
+  // ---------- new detection for alerts ----------
   const recentSeen = await getRecentSeen(env);
   const seenSet = new Set(recentSeen);
 
@@ -289,7 +343,6 @@ async function pollOnce(env) {
     return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: rows.length };
   }
 
-  const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
@@ -342,6 +395,7 @@ async function pollOnce(env) {
     }
   }
 
+  // update recentSeen
   const updatedSeen = [];
   const addSet = new Set();
   for (let i = 0; i < newOnes.length; i++) {
@@ -408,8 +462,8 @@ export default {
         return json({
           status: "running",
           app: "BSE Fastest JSON API",
-          version: "1.0-alert-first",
-          note: "Dedicated JSON-API only. /monitor or /monitor?burst=1. Cron min=1m; burst + external pings for faster.",
+          version: "1.1",
+          note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor",
         });
       }
 
@@ -437,13 +491,20 @@ export default {
         }
       }
 
+      // All recent announcements (for frontend main feed)
+      if (url.pathname === "/announcements") {
+        const items = await getRecentAnnouncements(env);
+        return json({ ok: true, count: items.length, items });
+      }
+
+      // Only watchlist-matched alerts
       if (url.pathname === "/alerts") {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
       if (url.pathname === "/bse-announcements") {
-        const items = await getAlerts(env);
-        return json({ ok: true, count: items.length, items, note: "alert-first mode: list = recent alerts only" });
+        const items = await getRecentAnnouncements(env);
+        return json({ ok: true, count: items.length, items });
       }
 
       if (url.pathname === "/categories") {
