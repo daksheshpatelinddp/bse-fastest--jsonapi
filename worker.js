@@ -95,7 +95,11 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
 }
 
 async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.NTFY_TOPIC) return;
+  // Trim defensively — a stray trailing newline/space pasted into the
+  // secret (common with `wrangler secret put` on Windows) silently
+  // breaks the request without ever showing an error.
+  const topic = String(env.NTFY_TOPIC || "").trim();
+  if (!topic) return;
 
   var pdfLink = normalizeBseLink(link);
   var targetLink =
@@ -109,29 +113,48 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
 
-  // Prefer plain ASCII-ish title for header safety; put full title in body
-  const safeTitle = String(title || "BSE Alert")
-    .replace(/[^\x20-\x7E]/g, "") // strip non-ASCII for header
-    .trim()
-    .slice(0, 120) || "BSE Alert";
+  // Use ntfy's JSON publish API instead of custom X-* headers.
+  // Header values must be Latin-1/ASCII-safe — a rupee sign, emoji,
+  // or any non-ASCII company/announcement text in X-Title/X-Click
+  // makes fetch() throw "Invalid header value" before the request is
+  // even sent. The JSON body has no such restriction, so this is both
+  // more reliable and lets titles keep their original characters.
+  const payload = {
+    topic,
+    title: String(title || "BSE Alert").slice(0, 200),
+    message: `${body}\n\nFetched: ${formattedFetchTime}`.slice(0, 4000),
+    click: targetLink,
+    tags: ["chart_with_upwards_trend", "warning"],
+    priority: 4,
+  };
 
   try {
-    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+    const res = await fetch("https://ntfy.sh/", {
       method: "POST",
-      headers: {
-        "X-Title": safeTitle,
-        "X-Click": targetLink,
-        "X-Tags": "chart_with_upwards_trend,warning",
-        "X-Priority": "4",
-      },
-      body: `${title}\n\n${body}\n\nFetched: ${formattedFetchTime}`,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
+
+    const resText = await res.text().catch(() => "");
+    await saveLastNtfyStatus(env, {
+      ok: res.ok,
+      status: res.status,
+      response: resText.slice(0, 500),
+      topic,
+      at: new Date().toISOString(),
     });
 
     if (!res.ok) {
-      console.error("ntfy HTTP error:", res.status, await res.text());
+      console.error("ntfy HTTP error:", res.status, resText);
     }
   } catch (err) {
     console.error("ntfy error:", err);
+    await saveLastNtfyStatus(env, {
+      ok: false,
+      error: String(err && err.message ? err.message : err),
+      topic,
+      at: new Date().toISOString(),
+    });
   }
 }
 
@@ -253,6 +276,16 @@ async function getAlerts(env) {
 async function saveAlerts(env, alerts) {
   if (!env.BSE_FASTEST_JSONAPIKV) return;
   await env.BSE_FASTEST_JSONAPIKV.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
+}
+
+async function saveLastNtfyStatus(env, status) {
+  if (!env.BSE_FASTEST_JSONAPIKV) return;
+  await env.BSE_FASTEST_JSONAPIKV.put("lastNtfyStatus", JSON.stringify(status));
+}
+
+async function getLastNtfyStatus(env) {
+  if (!env.BSE_FASTEST_JSONAPIKV) return null;
+  return await env.BSE_FASTEST_JSONAPIKV.get("lastNtfyStatus", "json");
 }
 
 async function getRecentAnnouncements(env) {
@@ -503,8 +536,8 @@ export default {
         return json({
           status: "running",
           app: "BSE Fastest JSON API",
-          version: "1.1.1",
-          note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor",
+          version: "1.1.2",
+          note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor + /ntfy-test + /ntfy-status",
         });
       }
 
@@ -550,6 +583,27 @@ export default {
 
       if (url.pathname === "/categories") {
         return json({ ok: true, categories: [] });
+      }
+
+      // Fires one real ntfy notification right now and reports exactly
+      // what ntfy.sh returned (or the exact error), so a delivery
+      // problem shows up immediately instead of only in worker logs.
+      if (url.pathname === "/ntfy-test") {
+        await sendNtfyAlert(
+          "BSE Fastest — test alert",
+          "If you see this on your device, ntfy delivery is working.",
+          "TEST",
+          "",
+          new Date().toISOString(),
+          env
+        );
+        return json({ ok: true, result: await getLastNtfyStatus(env) });
+      }
+
+      // Shows the outcome of the most recent ntfy send attempt
+      // (triggered by /monitor or the cron), without sending a new one.
+      if (url.pathname === "/ntfy-status") {
+        return json({ ok: true, ntfyTopicConfigured: !!(env.NTFY_TOPIC && env.NTFY_TOPIC.trim()), last: await getLastNtfyStatus(env) });
       }
 
       return json({ error: "Not found" }, 404);
