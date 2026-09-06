@@ -199,7 +199,7 @@ function matchesWatchlist(row, watchlist) {
   return false;
 }
 
-function rowToAnnouncement(row, fetchedAt, isAlert) {
+function rowToAnnouncement(row, fp, fetchedAt, isAlert) {
   const company = String(row.SLONGNAME || "").trim() || "Scrip";
   const scrip = String(row.SCRIP_CD || "").trim();
   const title = String(row.HEADLINE || row.NEWSSUB || "New Announcement").trim();
@@ -214,7 +214,7 @@ function rowToAnnouncement(row, fetchedAt, isAlert) {
     scrip,
     title,
     link,
-    fingerprint: computeFingerprint(row),
+    fingerprint: fp,
     pubDate: parsePubDate(row),
     fetchedAt,          // this is the first-seen time
     alert: !!isAlert,
@@ -330,7 +330,7 @@ async function fetchJsonPage1() {
   return data && Array.isArray(data.Table) ? data.Table : [];
 }
 
-async function pollOnce(env) {
+async function pollOnce(env, cachedWatchlist) {
   const fetchedAt = new Date().toISOString();
   let rows = [];
   try {
@@ -352,12 +352,41 @@ async function pollOnce(env) {
     page.push({ row, fp });
   }
 
-  const watchlist = await getWatchlist(env);
+  // ---------- cheap "is anything new at all?" check FIRST ----------
+  // This runs on every poll. The heavy merge/stringify/KV-write of
+  // recentAnnouncements below only needs to happen when something
+  // actually changed, which is most of the time NOT the case.
+  const recentSeen = await getRecentSeen(env);
+  const seenSet = new Set(recentSeen);
+
+  const watchlist = cachedWatchlist || (await getWatchlist(env));
+
+  if (recentSeen.length === 0) {
+    // Baseline run (first ever poll, or after a KV reset).
+    const currentPageItems = page.map(({ row, fp }) =>
+      rowToAnnouncement(row, fp, fetchedAt, matchesWatchlist(row, watchlist))
+    );
+    await saveRecentAnnouncements(env, currentPageItems.slice(0, MAX_RECENT_ANNOUNCEMENTS));
+    await saveRecentSeen(env, page.map((p) => p.fp));
+    return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: rows.length };
+  }
+
+  const newOnes = [];
+  for (let i = 0; i < page.length; i++) {
+    if (!seenSet.has(page[i].fp)) newOnes.push(page[i]);
+  }
+
+  if (newOnes.length === 0) {
+    // Nothing new — skip the merge + recentAnnouncements write entirely.
+    return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: rows.length };
+  }
+
+  // ---------- from here on, something IS new — do the heavier work ----------
 
   // Build current page items (temporary fetchedAt)
   const currentPageItems = page.map(({ row, fp }) => {
     const isAlert = matchesWatchlist(row, watchlist);
-    return rowToAnnouncement(row, fetchedAt, isAlert);
+    return rowToAnnouncement(row, fp, fetchedAt, isAlert);
   });
 
   // Merge with previously stored recent announcements
@@ -396,25 +425,6 @@ async function pollOnce(env) {
   }
 
   await saveRecentAnnouncements(env, merged);
-
-  // ---------- new detection for alerts ----------
-  const recentSeen = await getRecentSeen(env);
-  const seenSet = new Set(recentSeen);
-
-  if (recentSeen.length === 0) {
-    const fps = page.map((p) => p.fp);
-    await saveRecentSeen(env, fps);
-    return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: rows.length };
-  }
-
-  const newOnes = [];
-  for (let i = 0; i < page.length; i++) {
-    if (!seenSet.has(page[i].fp)) newOnes.push(page[i]);
-  }
-
-  if (newOnes.length === 0) {
-    return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: rows.length };
-  }
 
   const settings = await getNotificationSettings(env);
 
@@ -507,8 +517,13 @@ async function pollBurst(env) {
   let totalNew = 0;
   let totalAlerts = 0;
 
+  // Read once for the whole burst instead of once per poll — the
+  // watchlist rarely changes mid-burst, and this saves 3 redundant
+  // KV reads + JSON.parse calls per cron tick.
+  const watchlist = await getWatchlist(env);
+
   for (let i = 0; i < BURST_POLLS; i++) {
-    const r = await pollOnce(env);
+    const r = await pollOnce(env, watchlist);
     results.push(r);
     totalNew += r.newAnnouncements || 0;
     totalAlerts += r.newAlerts || 0;
