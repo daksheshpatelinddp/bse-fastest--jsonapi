@@ -209,7 +209,17 @@ async function getWatchlist(env) {
 
 async function setWatchlist(env, watchlist) {
   if (!env.BSE_FASTEST_JSONAPIKV) throw new Error("BSE_FASTEST_JSONAPIKV is not bound.");
-  await env.BSE_FASTEST_JSONAPIKV.put("watchlist", JSON.stringify(watchlist));
+  const value = JSON.stringify(watchlist);
+  try {
+    await env.BSE_FASTEST_JSONAPIKV.put("watchlist", value);
+  } catch (err) {
+    // Workers KV allows at most 1 write/sec to the same key. If two
+    // watchlist edits land within the same second, the second is
+    // rejected. Wait past that window and retry once rather than
+    // silently dropping the edit.
+    await sleep(1100);
+    await env.BSE_FASTEST_JSONAPIKV.put("watchlist", value);
+  }
 }
 
 async function getNotificationSettings(env) {
