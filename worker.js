@@ -1,9 +1,10 @@
 /*
- * BSE FASTEST JSON API – V1.1
+ * BSE FASTEST JSON API – V1.1.1
  * Dedicated project for BSE corporate announcements via JSON API only.
  *
  * - Shows ALL recent announcements in the frontend
  * - Sends Telegram / ntfy alerts ONLY for watchlist matches
+ * - Preserves original first-fetched time
  *
  * KV binding: BSE_FASTEST_JSONAPIKV
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -95,6 +96,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
 
 async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.NTFY_TOPIC) return;
+
   var pdfLink = normalizeBseLink(link);
   var targetLink =
     pdfLink && pdfLink !== "https://www.bseindia.com"
@@ -102,19 +104,32 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
       : scrip
         ? "https://www.bseindia.com/stock-share-price/" + scrip
         : "https://www.bseindia.com";
+
   const formattedFetchTime = fetchedAt
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
+
+  // Prefer plain ASCII-ish title for header safety; put full title in body
+  const safeTitle = String(title || "BSE Alert")
+    .replace(/[^\x20-\x7E]/g, "") // strip non-ASCII for header
+    .trim()
+    .slice(0, 120) || "BSE Alert";
+
   try {
-    await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
       method: "POST",
       headers: {
-        Title: title,
-        Click: targetLink,
-        Tags: "chart_with_upwards_trend,warning",
+        "X-Title": safeTitle,
+        "X-Click": targetLink,
+        "X-Tags": "chart_with_upwards_trend,warning",
+        "X-Priority": "4",
       },
-      body: `${body}\nFetched: ${formattedFetchTime}`,
+      body: `${title}\n\n${body}\n\nFetched: ${formattedFetchTime}`,
     });
+
+    if (!res.ok) {
+      console.error("ntfy HTTP error:", res.status, await res.text());
+    }
   } catch (err) {
     console.error("ntfy error:", err);
   }
@@ -178,7 +193,7 @@ function rowToAnnouncement(row, fetchedAt, isAlert) {
     link,
     fingerprint: computeFingerprint(row),
     pubDate: parsePubDate(row),
-    fetchedAt,
+    fetchedAt,          // this is the first-seen time
     alert: !!isAlert,
   };
 }
@@ -304,17 +319,41 @@ async function pollOnce(env) {
     page.push({ row, fp });
   }
 
-  // Always keep the latest page available for the frontend (all announcements)
   const watchlist = await getWatchlist(env);
+
+  // Build current page items (temporary fetchedAt)
   const currentPageItems = page.map(({ row, fp }) => {
     const isAlert = matchesWatchlist(row, watchlist);
     return rowToAnnouncement(row, fetchedAt, isAlert);
   });
 
-  // Merge with previously stored recent announcements (dedupe by fingerprint)
+  // Merge with previously stored recent announcements
+  // IMPORTANT: preserve the original fetchedAt of already-seen items
   const existing = await getRecentAnnouncements(env);
-  const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
-  const merged = [...currentPageItems];
+  const existingMap = new Map();
+  for (const item of existing) {
+    existingMap.set(item.fingerprint, item);
+  }
+
+  const merged = [];
+  const seenFp = new Set();
+
+  // First put newest page items, but keep original fetchedAt if we already had them
+  for (const item of currentPageItems) {
+    if (seenFp.has(item.fingerprint)) continue;
+    seenFp.add(item.fingerprint);
+
+    const prev = existingMap.get(item.fingerprint);
+    if (prev && prev.fetchedAt) {
+      // Keep the first-seen time
+      merged.push({ ...item, fetchedAt: prev.fetchedAt });
+    } else {
+      // Brand new → use current fetch time
+      merged.push(item);
+    }
+  }
+
+  // Then append older ones that are no longer on page 1
   for (const item of existing) {
     if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
     if (!seenFp.has(item.fingerprint)) {
@@ -322,6 +361,7 @@ async function pollOnce(env) {
       merged.push(item);
     }
   }
+
   await saveRecentAnnouncements(env, merged);
 
   // ---------- new detection for alerts ----------
@@ -370,6 +410,7 @@ async function pollOnce(env) {
         link = row.NSURL;
       }
 
+      // Use the first-seen time (this is a brand-new item, so current fetchedAt is correct)
       if (settings.telegram !== false) {
         await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
       }
@@ -386,7 +427,7 @@ async function pollOnce(env) {
         link,
         fingerprint: fp,
         pubDate,
-        fetchedAt,
+        fetchedAt,                 // first time we saw it
         alert: true,
         alertCreatedAt: new Date().toISOString(),
       });
@@ -462,7 +503,7 @@ export default {
         return json({
           status: "running",
           app: "BSE Fastest JSON API",
-          version: "1.1",
+          version: "1.1.1",
           note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor",
         });
       }
