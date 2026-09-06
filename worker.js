@@ -1,8 +1,8 @@
 /*
- * BSE FASTEST JSON API – V1.1.1
+ * BSE FASTEST JSON API – V1.2
  * Dedicated project for BSE corporate announcements via JSON API only.
  *
- * - Shows ALL recent announcements in the frontend
+ * - Frontend shows only watchlist-matched announcements (last 50)
  * - Sends Telegram / ntfy alerts ONLY for watchlist matches
  * - Preserves original first-fetched time
  *
@@ -14,8 +14,8 @@ const BSE_ANN_API =
   "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w";
 
 const MAX_RECENT_SEEN = 800;
-const MAX_ALERTS = 500;
-const MAX_RECENT_ANNOUNCEMENTS = 150;
+const MAX_ALERTS = 500;       // how many watchlist matches to retain in KV history
+const DISPLAY_LIMIT = 50;     // how many of those the frontend feed shows
 
 const BURST_POLLS = 4;
 const BURST_GAP_MS = 14000;
@@ -199,28 +199,6 @@ function matchesWatchlist(row, watchlist) {
   return false;
 }
 
-function rowToAnnouncement(row, fp, fetchedAt, isAlert) {
-  const company = String(row.SLONGNAME || "").trim() || "Scrip";
-  const scrip = String(row.SCRIP_CD || "").trim();
-  const title = String(row.HEADLINE || row.NEWSSUB || "New Announcement").trim();
-  let link = "";
-  if (row.ATTACHMENTNAME) {
-    link = `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${row.ATTACHMENTNAME}`;
-  } else if (row.NSURL) {
-    link = row.NSURL;
-  }
-  return {
-    company,
-    scrip,
-    title,
-    link,
-    fingerprint: fp,
-    pubDate: parsePubDate(row),
-    fetchedAt,          // this is the first-seen time
-    alert: !!isAlert,
-  };
-}
-
 /* ---------- KV helpers ---------- */
 
 async function getWatchlist(env) {
@@ -288,20 +266,6 @@ async function getLastNtfyStatus(env) {
   return await env.BSE_FASTEST_JSONAPIKV.get("lastNtfyStatus", "json");
 }
 
-async function getRecentAnnouncements(env) {
-  if (!env.BSE_FASTEST_JSONAPIKV) return [];
-  const data = await env.BSE_FASTEST_JSONAPIKV.get("recentAnnouncements", "json");
-  return Array.isArray(data) ? data : [];
-}
-
-async function saveRecentAnnouncements(env, list) {
-  if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await env.BSE_FASTEST_JSONAPIKV.put(
-    "recentAnnouncements",
-    JSON.stringify(list.slice(0, MAX_RECENT_ANNOUNCEMENTS))
-  );
-}
-
 /* ---------- core logic ---------- */
 
 async function fetchJsonPage1() {
@@ -352,21 +316,15 @@ async function pollOnce(env, cachedWatchlist) {
     page.push({ row, fp });
   }
 
-  // ---------- cheap "is anything new at all?" check FIRST ----------
-  // This runs on every poll. The heavy merge/stringify/KV-write of
-  // recentAnnouncements below only needs to happen when something
-  // actually changed, which is most of the time NOT the case.
+  // Cheap "is anything new at all?" check. The only KV write below
+  // (recentSeen, and alerts when a watchlist item matches) happens
+  // when something has actually changed — most polls end here.
   const recentSeen = await getRecentSeen(env);
   const seenSet = new Set(recentSeen);
 
-  const watchlist = cachedWatchlist || (await getWatchlist(env));
-
   if (recentSeen.length === 0) {
-    // Baseline run (first ever poll, or after a KV reset).
-    const currentPageItems = page.map(({ row, fp }) =>
-      rowToAnnouncement(row, fp, fetchedAt, matchesWatchlist(row, watchlist))
-    );
-    await saveRecentAnnouncements(env, currentPageItems.slice(0, MAX_RECENT_ANNOUNCEMENTS));
+    // Baseline run (first ever poll, or after a KV reset) — nothing
+    // to alert on yet, just record what we've seen.
     await saveRecentSeen(env, page.map((p) => p.fp));
     return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: rows.length };
   }
@@ -377,55 +335,10 @@ async function pollOnce(env, cachedWatchlist) {
   }
 
   if (newOnes.length === 0) {
-    // Nothing new — skip the merge + recentAnnouncements write entirely.
     return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: rows.length };
   }
 
-  // ---------- from here on, something IS new — do the heavier work ----------
-
-  // Build current page items (temporary fetchedAt)
-  const currentPageItems = page.map(({ row, fp }) => {
-    const isAlert = matchesWatchlist(row, watchlist);
-    return rowToAnnouncement(row, fp, fetchedAt, isAlert);
-  });
-
-  // Merge with previously stored recent announcements
-  // IMPORTANT: preserve the original fetchedAt of already-seen items
-  const existing = await getRecentAnnouncements(env);
-  const existingMap = new Map();
-  for (const item of existing) {
-    existingMap.set(item.fingerprint, item);
-  }
-
-  const merged = [];
-  const seenFp = new Set();
-
-  // First put newest page items, but keep original fetchedAt if we already had them
-  for (const item of currentPageItems) {
-    if (seenFp.has(item.fingerprint)) continue;
-    seenFp.add(item.fingerprint);
-
-    const prev = existingMap.get(item.fingerprint);
-    if (prev && prev.fetchedAt) {
-      // Keep the first-seen time
-      merged.push({ ...item, fetchedAt: prev.fetchedAt });
-    } else {
-      // Brand new → use current fetch time
-      merged.push(item);
-    }
-  }
-
-  // Then append older ones that are no longer on page 1
-  for (const item of existing) {
-    if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
-    if (!seenFp.has(item.fingerprint)) {
-      seenFp.add(item.fingerprint);
-      merged.push(item);
-    }
-  }
-
-  await saveRecentAnnouncements(env, merged);
-
+  const watchlist = cachedWatchlist || (await getWatchlist(env));
   const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
@@ -580,19 +493,21 @@ export default {
         }
       }
 
-      // All recent announcements (for frontend main feed)
+      // Frontend main feed: only watchlist matches, most recent first,
+      // capped for display (full history still kept via /alerts).
       if (url.pathname === "/announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
-      // Only watchlist-matched alerts
+      // Only watchlist-matched alerts (full retained history, up to MAX_ALERTS)
       if (url.pathname === "/alerts") {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
+      // Legacy alias, kept for backward compatibility — same as /announcements
       if (url.pathname === "/bse-announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
