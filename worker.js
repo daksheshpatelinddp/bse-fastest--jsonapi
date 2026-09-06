@@ -201,6 +201,28 @@ function matchesWatchlist(row, watchlist) {
 
 /* ---------- KV helpers ---------- */
 
+
+// Workers KV allows at most 1 write/sec per key. If two requests try to
+// write the same key within that window, one is rejected. This wraps
+// every KV write with a few retries, backing off past the 1-second
+// window with a little random jitter each time so concurrent retries
+// don't keep landing on top of each other and colliding again.
+async function kvPut(env, key, value, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await env.BSE_FASTEST_JSONAPIKV.put(key, value);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await sleep(1050 + Math.floor(Math.random() * 400));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function getWatchlist(env) {
   if (!env.BSE_FASTEST_JSONAPIKV) return [];
   const data = await env.BSE_FASTEST_JSONAPIKV.get("watchlist", "json");
@@ -209,17 +231,7 @@ async function getWatchlist(env) {
 
 async function setWatchlist(env, watchlist) {
   if (!env.BSE_FASTEST_JSONAPIKV) throw new Error("BSE_FASTEST_JSONAPIKV is not bound.");
-  const value = JSON.stringify(watchlist);
-  try {
-    await env.BSE_FASTEST_JSONAPIKV.put("watchlist", value);
-  } catch (err) {
-    // Workers KV allows at most 1 write/sec to the same key. If two
-    // watchlist edits land within the same second, the second is
-    // rejected. Wait past that window and retry once rather than
-    // silently dropping the edit.
-    await sleep(1100);
-    await env.BSE_FASTEST_JSONAPIKV.put("watchlist", value);
-  }
+  await kvPut(env, "watchlist", JSON.stringify(watchlist));
 }
 
 async function getNotificationSettings(env) {
@@ -230,7 +242,7 @@ async function getNotificationSettings(env) {
 
 async function setNotificationSettings(env, settings) {
   if (!env.BSE_FASTEST_JSONAPIKV) throw new Error("BSE_FASTEST_JSONAPIKV is not bound.");
-  await env.BSE_FASTEST_JSONAPIKV.put("notificationSettings", JSON.stringify(settings));
+  await kvPut(env, "notificationSettings", JSON.stringify(settings));
 }
 
 async function getRecentSeen(env) {
@@ -241,7 +253,7 @@ async function getRecentSeen(env) {
 
 async function saveRecentSeen(env, ids) {
   if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await env.BSE_FASTEST_JSONAPIKV.put("recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+  await kvPut(env, "recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
 }
 
 async function getAlertFingerprints(env) {
@@ -252,7 +264,7 @@ async function getAlertFingerprints(env) {
 
 async function saveAlertFingerprints(env, list) {
   if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await env.BSE_FASTEST_JSONAPIKV.put("alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 2)));
+  await kvPut(env, "alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 2)));
 }
 
 async function getAlerts(env) {
@@ -263,12 +275,12 @@ async function getAlerts(env) {
 
 async function saveAlerts(env, alerts) {
   if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await env.BSE_FASTEST_JSONAPIKV.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
+  await kvPut(env, "specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
 async function saveLastNtfyStatus(env, status) {
   if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await env.BSE_FASTEST_JSONAPIKV.put("lastNtfyStatus", JSON.stringify(status));
+  await kvPut(env, "lastNtfyStatus", JSON.stringify(status));
 }
 
 async function getLastNtfyStatus(env) {
