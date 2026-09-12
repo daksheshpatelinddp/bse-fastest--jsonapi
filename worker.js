@@ -3,11 +3,11 @@
  * Dedicated project for BSE corporate announcements via JSON API only.
  *
  * - Frontend shows only watchlist-matched announcements (last 50)
- * - Sends Telegram / ntfy alerts ONLY for watchlist matches
+ * - Sends Telegram alerts ONLY for watchlist matches
  * - Preserves original first-fetched time
  *
  * KV binding: BSE_FASTEST_JSONAPIKV
- * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
+ * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  */
 
 const BSE_ANN_API =
@@ -94,70 +94,6 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   }
 }
 
-async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  // Trim defensively — a stray trailing newline/space pasted into the
-  // secret (common with `wrangler secret put` on Windows) silently
-  // breaks the request without ever showing an error.
-  const topic = String(env.NTFY_TOPIC || "").trim();
-  if (!topic) return;
-
-  var pdfLink = normalizeBseLink(link);
-  var targetLink =
-    pdfLink && pdfLink !== "https://www.bseindia.com"
-      ? pdfLink
-      : scrip
-        ? "https://www.bseindia.com/stock-share-price/" + scrip
-        : "https://www.bseindia.com";
-
-  const formattedFetchTime = fetchedAt
-    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
-    : "N/A";
-
-  // Use ntfy's JSON publish API instead of custom X-* headers.
-  // Header values must be Latin-1/ASCII-safe — a rupee sign, emoji,
-  // or any non-ASCII company/announcement text in X-Title/X-Click
-  // makes fetch() throw "Invalid header value" before the request is
-  // even sent. The JSON body has no such restriction, so this is both
-  // more reliable and lets titles keep their original characters.
-  const payload = {
-    topic,
-    title: String(title || "BSE Alert").slice(0, 200),
-    message: `${body}\n\nFetched: ${formattedFetchTime}`.slice(0, 4000),
-    click: targetLink,
-    tags: ["chart_with_upwards_trend", "warning"],
-    priority: 4,
-  };
-
-  try {
-    const res = await fetch("https://ntfy.sh/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify(payload),
-    });
-
-    const resText = await res.text().catch(() => "");
-    await saveLastNtfyStatus(env, {
-      ok: res.ok,
-      status: res.status,
-      response: resText.slice(0, 500),
-      topic,
-      at: new Date().toISOString(),
-    });
-
-    if (!res.ok) {
-      console.error("ntfy HTTP error:", res.status, resText);
-    }
-  } catch (err) {
-    console.error("ntfy error:", err);
-    await saveLastNtfyStatus(env, {
-      ok: false,
-      error: String(err && err.message ? err.message : err),
-      topic,
-      at: new Date().toISOString(),
-    });
-  }
-}
-
 function parsePubDate(row) {
   let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM || "";
   if (!pubDate) return "";
@@ -235,9 +171,9 @@ async function setWatchlist(env, watchlist) {
 }
 
 async function getNotificationSettings(env) {
-  if (!env.BSE_FASTEST_JSONAPIKV) return { telegram: true, ntfy: true };
+  if (!env.BSE_FASTEST_JSONAPIKV) return { telegram: true };
   const data = await env.BSE_FASTEST_JSONAPIKV.get("notificationSettings", "json");
-  return data || { telegram: true, ntfy: true };
+  return data || { telegram: true };
 }
 
 async function setNotificationSettings(env, settings) {
@@ -278,17 +214,40 @@ async function saveAlerts(env, alerts) {
   await kvPut(env, "specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
-async function saveLastNtfyStatus(env, status) {
-  if (!env.BSE_FASTEST_JSONAPIKV) return;
-  await kvPut(env, "lastNtfyStatus", JSON.stringify(status));
-}
-
-async function getLastNtfyStatus(env) {
-  if (!env.BSE_FASTEST_JSONAPIKV) return null;
-  return await env.BSE_FASTEST_JSONAPIKV.get("lastNtfyStatus", "json");
-}
-
 /* ---------- core logic ---------- */
+
+// "fetch failed" (as opposed to an HTTP error status, which throws
+// "BSE JSON HTTP xxx" below) means the request never got a response at
+// all — a dropped connection, TLS hiccup, or DNS blip between the
+// Workers edge and BSE's API. These are usually transient, so instead
+// of letting one bad connection fail the whole poll, retry a couple of
+// times with a short backoff. A per-attempt timeout also guards against
+// a hung connection eating the Worker's wall-clock time silently.
+async function fetchJsonPage1Attempt(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "application/json, text/plain, */*",
+        Referer: "https://www.bseindia.com/",
+        Origin: "https://www.bseindia.com",
+        "Cache-Control": "no-cache",
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) throw new Error(`BSE JSON HTTP ${response.status}`);
+    const data = await response.json();
+    return data && Array.isArray(data.Table) ? data.Table : [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function fetchJsonPage1() {
   const dateStr = getIstDateStr();
@@ -298,22 +257,20 @@ async function fetchJsonPage1() {
     `&strPrevDate=${dateStr}&strToDate=${dateStr}` +
     `&strSearch=P&strscrip=&strType=C`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "application/json, text/plain, */*",
-      Referer: "https://www.bseindia.com/",
-      Origin: "https://www.bseindia.com",
-      "Cache-Control": "no-cache",
-    },
-    cf: { cacheTtl: 0, cacheEverything: false },
-  });
-
-  if (!response.ok) throw new Error(`BSE JSON HTTP ${response.status}`);
-  const data = await response.json();
-  return data && Array.isArray(data.Table) ? data.Table : [];
+  const ATTEMPTS = 3;
+  const TIMEOUT_MS = 8000;
+  let lastErr;
+  for (let i = 0; i < ATTEMPTS; i++) {
+    try {
+      return await fetchJsonPage1Attempt(url, TIMEOUT_MS);
+    } catch (err) {
+      lastErr = err;
+      // Only retry on network-level/transient failures, not on a
+      // clean HTTP error status from BSE itself.
+      if (i < ATTEMPTS - 1) await sleep(600 + i * 800);
+    }
+  }
+  throw lastErr;
 }
 
 async function pollOnce(env, cachedWatchlist) {
@@ -391,9 +348,6 @@ async function pollOnce(env, cachedWatchlist) {
       // Use the first-seen time (this is a brand-new item, so current fetchedAt is correct)
       if (settings.telegram !== false) {
         await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
-      }
-      if (settings.ntfy !== false) {
-        await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
       }
 
       const pubDate = parsePubDate(row);
@@ -487,7 +441,7 @@ export default {
           status: "running",
           app: "BSE Fastest JSON API",
           version: "1.1.2",
-          note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor + /ntfy-test + /ntfy-status",
+          note: "Shows all announcements. Alerts only for watchlist. /announcements + /alerts + /monitor",
         });
       }
 
@@ -535,27 +489,6 @@ export default {
 
       if (url.pathname === "/categories") {
         return json({ ok: true, categories: [] });
-      }
-
-      // Fires one real ntfy notification right now and reports exactly
-      // what ntfy.sh returned (or the exact error), so a delivery
-      // problem shows up immediately instead of only in worker logs.
-      if (url.pathname === "/ntfy-test") {
-        await sendNtfyAlert(
-          "BSE Fastest — test alert",
-          "If you see this on your device, ntfy delivery is working.",
-          "TEST",
-          "",
-          new Date().toISOString(),
-          env
-        );
-        return json({ ok: true, result: await getLastNtfyStatus(env) });
-      }
-
-      // Shows the outcome of the most recent ntfy send attempt
-      // (triggered by /monitor or the cron), without sending a new one.
-      if (url.pathname === "/ntfy-status") {
-        return json({ ok: true, ntfyTopicConfigured: !!(env.NTFY_TOPIC && env.NTFY_TOPIC.trim()), last: await getLastNtfyStatus(env) });
       }
 
       return json({ error: "Not found" }, 404);
